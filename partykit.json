@@ -1,0 +1,9 @@
+{
+  "name": "imposter-clue-game",
+  "main": "partykit/game.room.ts",
+  "parties": {
+    "game": "partykit/game.room.ts"
+  },
+  "compatibilityDate": "2024-10-01"
+}
+

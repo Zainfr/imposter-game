@@ -1,0 +1,561 @@
+import type * as Party from "partykit/server";
+import {
+  type ClientEvent,
+  type GameResult,
+  type GameState,
+  type Phase,
+  type Player,
+  type ServerEvent
+} from "../shared/event.contracts";
+import {
+  CLUE_SECONDS,
+  DISCONNECT_GRACE_MS,
+  GUESS_SECONDS,
+  VOTING_SECONDS,
+  createInitialState,
+  isActionAllowed,
+  pickImposter,
+  serialize
+} from "./utils";
+import { WordService } from "./word.service";
+import type { WordCategoryId } from "../shared/event.contracts";
+
+type TimerHandle = ReturnType<typeof setTimeout> | null;
+
+export default class GameRoom implements Party.Server {
+  readonly room: Party.Room;
+  readonly wordService = new WordService();
+
+  state: GameState = createInitialState();
+  private phaseTimer: TimerHandle = null;
+  private disconnectTimers = new Map<string, TimerHandle>();
+  private turnOrder: string[] = [];
+
+  constructor(room: Party.Room) {
+    this.room = room;
+  }
+
+  readonly options: Party.ServerOptions = {
+    hibernate: true
+  };
+
+  onStart() {
+    this.state = createInitialState();
+  }
+
+  onConnect(connection: Party.Connection) {
+    const existing = this.state.players[connection.id];
+    if (existing) {
+      this.clearDisconnectTimer(connection.id);
+      this.state.players[connection.id] = {
+        ...existing,
+        connected: true
+      };
+      this.sendState(connection);
+      return;
+    }
+
+    if (this.state.phase !== "lobby") {
+      this.sendEvent(connection, {
+        type: "error",
+        message: "Game already started"
+      });
+      connection.close();
+      return;
+    }
+
+    const player: Player = {
+      id: connection.id,
+      name: "Player",
+      isImposter: false,
+      score: 0,
+      connected: true
+    };
+
+    this.state.players[player.id] = player;
+
+    const joinEvent: ServerEvent = {
+      type: "player_joined",
+      player
+    };
+
+    this.room.broadcast(serialize(joinEvent));
+    this.broadcastStateToAll();
+  }
+
+  onMessage(message: string, sender: Party.Connection) {
+    let event: ClientEvent;
+    try {
+      event = JSON.parse(message) as ClientEvent;
+    } catch {
+      this.sendError(sender, "Invalid message format");
+      return;
+    }
+
+    switch (event.type) {
+      case "join":
+        this.handleJoin(sender, event.name);
+        break;
+      case "start_game":
+        this.handleStartGame(sender, event.categoryId);
+        break;
+      case "submit_clue":
+        this.handleSubmitClue(sender, event.clue);
+        break;
+      case "submit_vote":
+        this.handleSubmitVote(sender, event.targetId);
+        break;
+      case "imposter_guess":
+        this.handleImposterGuess(sender, event.word);
+        break;
+      case "leave":
+        this.handleLeave(sender);
+        break;
+      default:
+        this.sendError(sender, "Unknown event");
+    }
+  }
+
+  onClose(connection: Party.Connection) {
+    const player = this.state.players[connection.id];
+    if (!player) return;
+
+    this.state.players[connection.id] = {
+      ...player,
+      connected: false
+    };
+
+    const leaveEvent: ServerEvent = {
+      type: "player_left",
+      playerId: connection.id
+    };
+
+    this.room.broadcast(serialize(leaveEvent));
+    this.broadcastStateToAll();
+
+    const timer = setTimeout(() => {
+      this.disconnectTimers.delete(connection.id);
+      this.removePlayer(connection.id);
+    }, DISCONNECT_GRACE_MS);
+
+    this.disconnectTimers.set(connection.id, timer);
+  }
+
+  private handleJoin(connection: Party.Connection, name: string) {
+    const trimmedName = name.trim().slice(0, 18) || "Player";
+
+    const existing = this.state.players[connection.id];
+    if (existing) {
+      this.state.players[connection.id] = {
+        ...existing,
+        name: trimmedName,
+        connected: true
+      };
+      this.clearDisconnectTimer(connection.id);
+    } else {
+      if (this.state.phase !== "lobby") {
+        this.sendError(connection, "Cannot join after game start");
+        return;
+      }
+
+      const player: Player = {
+        id: connection.id,
+        name: trimmedName,
+        isImposter: false,
+        score: 0,
+        connected: true
+      };
+
+      this.state.players[player.id] = player;
+
+      const joinEvent: ServerEvent = {
+        type: "player_joined",
+        player
+      };
+      this.room.broadcast(serialize(joinEvent));
+    }
+
+    this.broadcastStateToAll();
+  }
+
+  private handleStartGame(
+    connection: Party.Connection,
+    categoryId?: WordCategoryId
+  ) {
+    if (!isActionAllowed(this.state, "lobby")) {
+      this.sendError(connection, "Game already started");
+      return;
+    }
+
+    const playerCount = Object.values(this.state.players).filter(
+      (p) => p.connected
+    ).length;
+
+    if (playerCount < 4) {
+      this.sendError(connection, "Need at least 4 players to start");
+      return;
+    }
+
+    const imposterId = pickImposter(this.state.players);
+    if (!imposterId) {
+      this.sendError(connection, "Unable to assign imposter");
+      return;
+    }
+
+    const category: WordCategoryId = categoryId ?? "clash_royale";
+    const selection = this.wordService.getRandomWord(category);
+    this.state.secretWord = selection.word;
+    this.state.imposterWord = null;
+
+    for (const player of Object.values(this.state.players)) {
+      player.isImposter = player.id === imposterId;
+    }
+
+    this.turnOrder = Object.keys(this.state.players);
+    this.state.currentTurnPlayerId = this.getNextTurnPlayerId();
+
+    this.state.phase = "clue";
+    this.state.round = 1;
+    this.state.clues[1] = {};
+    this.state.votes = {};
+    this.state.timerEndsAt = this.futureTimestampSeconds(CLUE_SECONDS);
+    this.state.categoryId = category;
+
+    this.broadcastPhaseChanged("clue");
+    this.broadcastStateToAll();
+    this.schedulePhaseTimer("clue", CLUE_SECONDS);
+  }
+
+  private handleSubmitClue(connection: Party.Connection, clue: string) {
+    if (!isActionAllowed(this.state, "clue")) {
+      this.sendError(connection, "Not in clue phase");
+      return;
+    }
+
+    const player = this.state.players[connection.id];
+    if (!player) {
+      this.sendError(connection, "Unknown player");
+      return;
+    }
+
+    if (
+      this.state.currentTurnPlayerId &&
+      this.state.currentTurnPlayerId !== connection.id
+    ) {
+      this.sendError(connection, "Not your turn to give a clue");
+      return;
+    }
+
+    const normalized = clue.trim();
+    if (!normalized) {
+      this.sendError(connection, "Clue cannot be empty");
+      return;
+    }
+
+    if (normalized.length > 80) {
+      this.sendError(connection, "Clue too long");
+      return;
+    }
+
+    const round = this.state.round;
+    if (!this.state.clues[round]) {
+      this.state.clues[round] = {};
+    }
+
+    if (this.state.clues[round][player.id]) {
+      this.sendError(connection, "You already submitted a clue");
+      return;
+    }
+
+    const now = Date.now();
+    if (this.state.timerEndsAt && now > this.state.timerEndsAt) {
+      this.sendError(connection, "Clue phase has ended");
+      return;
+    }
+
+    this.state.clues[round][player.id] = normalized;
+    this.broadcastStateToAll();
+    this.advanceClueTurn();
+  }
+
+  private handleSubmitVote(connection: Party.Connection, targetId: string) {
+    if (!isActionAllowed(this.state, "voting")) {
+      this.sendError(connection, "Not in voting phase");
+      return;
+    }
+
+    const player = this.state.players[connection.id];
+    if (!player) {
+      this.sendError(connection, "Unknown player");
+      return;
+    }
+
+    if (connection.id === targetId) {
+      this.sendError(connection, "Cannot vote for yourself");
+      return;
+    }
+
+    if (!this.state.players[targetId]) {
+      this.sendError(connection, "Invalid vote target");
+      return;
+    }
+
+    if (this.state.votes[player.id]) {
+      this.sendError(connection, "You already voted");
+      return;
+    }
+
+    const now = Date.now();
+    if (this.state.timerEndsAt && now > this.state.timerEndsAt) {
+      this.sendError(connection, "Voting phase has ended");
+      return;
+    }
+
+    this.state.votes[player.id] = targetId;
+    this.broadcastStateToAll();
+
+    const eligibleVoters = Object.values(this.state.players).filter(
+      (p) => p.connected
+    );
+    const votesCount = Object.keys(this.state.votes).length;
+
+    if (votesCount >= eligibleVoters.length) {
+      this.resolveVoting();
+    }
+  }
+
+  private handleImposterGuess(connection: Party.Connection, word: string) {
+    if (!isActionAllowed(this.state, "guess")) {
+      this.sendError(connection, "Not in guess phase");
+      return;
+    }
+
+    const player = this.state.players[connection.id];
+    if (!player || !player.isImposter) {
+      this.sendError(connection, "Only imposter may guess");
+      return;
+    }
+
+    const normalized = word.trim().toLowerCase();
+    if (!normalized) {
+      this.sendError(connection, "Guess cannot be empty");
+      return;
+    }
+
+    const result: GameResult =
+      normalized === this.state.secretWord.toLowerCase() ? "imposter" : "team";
+
+    this.finishGame(result);
+  }
+
+  private handleLeave(connection: Party.Connection) {
+    this.removePlayer(connection.id);
+    connection.close();
+  }
+
+  private advanceFromClue() {
+    const nextRound = this.state.round + 1;
+    if (nextRound <= this.state.maxRounds) {
+      this.state.round = nextRound;
+      this.state.clues[nextRound] = {};
+      this.state.timerEndsAt = this.futureTimestampSeconds(CLUE_SECONDS);
+      this.state.currentTurnPlayerId = this.getNextTurnPlayerId();
+      this.broadcastPhaseChanged("clue");
+      this.broadcastStateToAll();
+      this.schedulePhaseTimer("clue", CLUE_SECONDS);
+    } else {
+      this.state.phase = "voting";
+      this.state.votes = {};
+      this.state.timerEndsAt = this.futureTimestampSeconds(VOTING_SECONDS);
+      this.state.currentTurnPlayerId = undefined;
+      this.broadcastPhaseChanged("voting");
+      this.broadcastStateToAll();
+      this.schedulePhaseTimer("voting", VOTING_SECONDS);
+    }
+  }
+
+  private resolveVoting() {
+    const tally: Record<string, number> = {};
+    for (const target of Object.values(this.state.votes)) {
+      tally[target] = (tally[target] ?? 0) + 1;
+    }
+
+    let eliminatedId: string | null = null;
+    let bestVotes = 0;
+    for (const [target, count] of Object.entries(tally)) {
+      if (count > bestVotes) {
+        bestVotes = count;
+        eliminatedId = target;
+      } else if (count === bestVotes) {
+        eliminatedId = null;
+      }
+    }
+
+    if (eliminatedId) {
+      const eliminated = this.state.players[eliminatedId];
+      if (eliminated) {
+        if (eliminated.isImposter) {
+          for (const player of Object.values(this.state.players)) {
+            if (!player.isImposter) {
+              player.score += 1;
+            }
+          }
+        } else {
+          const imposter = Object.values(this.state.players).find(
+            (p) => p.isImposter
+          );
+          if (imposter) {
+            imposter.score += 1;
+          }
+        }
+      }
+    }
+
+    this.state.phase = "guess";
+    this.state.timerEndsAt = this.futureTimestampSeconds(GUESS_SECONDS);
+    this.broadcastPhaseChanged("guess");
+    this.broadcastStateToAll();
+    this.schedulePhaseTimer("guess", GUESS_SECONDS);
+  }
+
+  private finishGame(result: GameResult) {
+    this.clearPhaseTimer();
+    this.state.phase = "finished";
+    this.state.timerEndsAt = undefined;
+
+    const event: ServerEvent = {
+      type: "game_finished",
+      result
+    };
+
+    this.room.broadcast(serialize(event));
+    this.broadcastStateToAll();
+  }
+
+  private schedulePhaseTimer(phase: Phase, seconds: number) {
+    this.clearPhaseTimer();
+    const expectedEnd = this.state.timerEndsAt ?? this.futureTimestampSeconds(seconds);
+    this.state.timerEndsAt = expectedEnd;
+
+    this.phaseTimer = setTimeout(() => {
+      if (this.state.phase !== phase) return;
+
+      switch (phase) {
+        case "clue":
+          this.advanceFromClue();
+          break;
+        case "voting":
+          this.resolveVoting();
+          break;
+        case "guess":
+          this.finishGame("team");
+          break;
+        default:
+          break;
+      }
+    }, seconds * 1000);
+  }
+
+  private clearPhaseTimer() {
+    if (this.phaseTimer) {
+      clearTimeout(this.phaseTimer);
+      this.phaseTimer = null;
+    }
+  }
+
+  private removePlayer(playerId: string) {
+    const existing = this.state.players[playerId];
+    if (!existing) return;
+
+    delete this.state.players[playerId];
+
+    if (Object.keys(this.state.players).length < 2) {
+      this.finishGame("imposter");
+    } else {
+      this.broadcastStateToAll();
+    }
+  }
+
+  private broadcastStateToAll() {
+    for (const connection of this.room.getConnections()) {
+      this.sendState(connection);
+    }
+  }
+
+  private sendState(connection: Party.Connection) {
+    this.sendEvent(connection, {
+      type: "state_update",
+      state: {
+        ...this.state,
+        selfId: connection.id
+      }
+    });
+  }
+
+  private getNextTurnPlayerId(): string | undefined {
+    for (const id of this.turnOrder) {
+      const p = this.state.players[id];
+      if (p && p.connected) return id;
+    }
+    return undefined;
+  }
+
+  private advanceClueTurn() {
+    const round = this.state.round;
+    const currentId = this.state.currentTurnPlayerId;
+    const startIndex = currentId
+      ? this.turnOrder.indexOf(currentId) + 1
+      : 0;
+
+    const total = this.turnOrder.length;
+    for (let i = 0; i < total; i++) {
+      const idx = (startIndex + i) % total;
+      const id = this.turnOrder[idx];
+      const player = this.state.players[id];
+      if (!player || !player.connected) continue;
+
+      const hasClue = this.state.clues[round]?.[id];
+      if (!hasClue) {
+        this.state.currentTurnPlayerId = id;
+        this.broadcastStateToAll();
+        return;
+      }
+    }
+
+    // Everyone has given a clue for this round
+    this.advanceFromClue();
+  }
+
+  private clearDisconnectTimer(playerId: string) {
+    const timer = this.disconnectTimers.get(playerId);
+    if (timer) {
+      clearTimeout(timer);
+      this.disconnectTimers.delete(playerId);
+    }
+  }
+
+  private broadcastPhaseChanged(phase: Phase) {
+    const event: ServerEvent = {
+      type: "phase_changed",
+      phase
+    };
+    this.room.broadcast(serialize(event));
+  }
+
+  private sendEvent(connection: Party.Connection, event: ServerEvent) {
+    connection.send(serialize(event));
+  }
+
+  private sendError(connection: Party.Connection, message: string) {
+    const event: ServerEvent = {
+      type: "error",
+      message
+    };
+    connection.send(serialize(event));
+  }
+
+  private futureTimestampSeconds(seconds: number): number {
+    return Date.now() + seconds * 1000;
+  }
+}
+
