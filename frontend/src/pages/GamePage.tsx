@@ -113,7 +113,7 @@ export const GamePage: React.FC = () => {
           </div>
         </div>
 
-        <button type="button" onClick={leave} className="btn btn-ghost btn-sm">
+        <button type="button" onClick={leave} className="btn bg-error btn-xs px-2 py-1">
           Leave
         </button>
       </header>
@@ -145,19 +145,19 @@ export const GamePage: React.FC = () => {
             >
               <div className="flex items-center gap-2">
                 <span className="avatar placeholder">
-                  <span className="bg-neutral text-neutral-content rounded-full w-9">
+                  <span className="bg-neutral text-neutral-content flex items-center justify-center rounded-full w-9 h-9">
                   {p.name.slice(0, 2).toUpperCase()}
                   </span>
                 </span>
                 <div className="flex flex-col">
                   <span
-                    className={`text-xs ${
+                    className={`text-sm ${
                       p.id === playerId ? "font-semibold" : ""
                     }`}
                   >
                     {p.name}
                     {p.id === playerId && (
-                      <span className="badge badge-success badge-outline badge-sm ml-2">
+                      <span className="badge badge-secondary badge-outline badge-sm ml-2">
                         You
                       </span>
                     )}
@@ -204,7 +204,7 @@ export const GamePage: React.FC = () => {
                           className="flex items-start gap-2 rounded-box bg-base-100 px-3 py-2"
                         >
                           <span className="avatar placeholder">
-                            <span className="bg-neutral text-neutral-content rounded-full w-7 text-xs">
+                            <span className="bg-neutral text-neutral-content flex items-center justify-center rounded-full w-7 h-7 text-xs">
                               {p.name.slice(0, 2).toUpperCase()}
                             </span>
                           </span>
@@ -288,7 +288,7 @@ export const GamePage: React.FC = () => {
                     type="button"
                     disabled={hasVoted && !isMyVote}
                     onClick={() => submitVote(p.id)}
-                    className={`btn h-auto min-h-0 flex-col items-start gap-0 px-3 py-3 text-left ${
+                    className={`btn h-auto min-h-0 flex-col items-center gap-0 px-3 py-3 text-left ${
                       isMyVote ? "btn-error" : "btn-ghost"
                     }`}
                   >

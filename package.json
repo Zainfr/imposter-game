@@ -9,6 +9,7 @@
     "dev:server": "partykit dev"
   },
   "dependencies": {
+    "daisyui": "^4.12.24",
     "partysocket": "^1.0.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
@@ -19,7 +20,6 @@
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react-swc": "^3.6.0",
     "autoprefixer": "^10.4.20",
-    "daisyui": "^5.5.19",
     "partykit": "^0.0.0-5527a74",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.15",

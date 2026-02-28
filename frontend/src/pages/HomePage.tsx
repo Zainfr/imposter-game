@@ -62,10 +62,10 @@ export const HomePage: React.FC = () => {
               <label className="label py-1">
                 <span className="label-text">Word category</span>
               </label>
-              <div className="join w-full">
+              <div className="join w-full h-full border border-primary">
                 <button
                   type="button"
-                  className={`btn btn-xs sm:btn-sm join-item w-1/3 ${
+                  className={`btn btn-xs sm:btn-sm h-8 join-item w-1/3 ${
                     categoryId === "clash_royale" ? "btn-primary" : "btn-ghost"
                   }`}
                   onClick={() => setCategoryId("clash_royale")}
@@ -74,7 +74,7 @@ export const HomePage: React.FC = () => {
                 </button>
                 <button
                   type="button"
-                  className={`btn btn-xs sm:btn-sm join-item w-1/3 ${
+                  className={`btn btn-xs sm:btn-sm h-8 join-item w-1/3 ${
                     categoryId === "animals" ? "btn-primary" : "btn-ghost"
                   }`}
                   onClick={() => setCategoryId("animals")}
@@ -83,7 +83,7 @@ export const HomePage: React.FC = () => {
                 </button>
                 <button
                   type="button"
-                  className={`btn btn-xs sm:btn-sm join-item w-1/3 ${
+                  className={`btn btn-xs sm:btn-sm h-8 join-item w-1/3 ${
                     categoryId === "countries" ? "btn-primary" : "btn-ghost"
                   }`}
                   onClick={() => setCategoryId("countries")}
@@ -125,6 +125,7 @@ export const HomePage: React.FC = () => {
                 : roomCode
                 ? "Join room"
                 : "Quick play"}
+                ⚡
             </button>
 
             {error && (
@@ -134,18 +135,6 @@ export const HomePage: React.FC = () => {
             )}
           </div>
         </div>
-      </section>
-
-      <section className="mt-auto space-y-3 text-sm opacity-80">
-        <div className="flex items-center justify-between rounded-box bg-base-100 px-3 py-2 shadow">
-          <span className="font-medium">Real-time feel</span>
-          <span className="badge badge-ghost">PartyKit edge</span>
-        </div>
-        <p className="text-sm opacity-80">
-          Optimized for thumbs: large tap targets, minimal typing, and legible
-          typography on small screens. The lobby will show players joining in
-          real time.
-        </p>
       </section>
     </div>
   );
