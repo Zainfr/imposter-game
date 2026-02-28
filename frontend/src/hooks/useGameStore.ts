@@ -19,6 +19,7 @@ interface GameStore {
   error?: string;
   socket: PartySocket | null;
   categoryId: WordCategoryId;
+  timerWarning: boolean;
 
   setName(name: string): void;
   setRoomCode(code: string): void;
@@ -58,6 +59,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
   error: undefined,
   socket: null,
   categoryId: "clash_royale",
+  timerWarning: false,
 
   setName(name: string) {
     set({ name });
@@ -104,7 +106,22 @@ export const useGameStore = create<GameStore>((set, get) => ({
           const data = JSON.parse(event.data) as ServerEvent;
           if (data.type === "state_update") {
             const selfId = data.state.selfId ?? null;
-            set({ state: data.state, playerId: selfId });
+            // Clear warning when a fresh state arrives (phase may have changed)
+            set({ state: data.state, playerId: selfId, timerWarning: false });
+          } else if (data.type === "timer_sync") {
+            // Patch only the timer fields to avoid full re-render
+            const cur = get().state;
+            if (cur) {
+              set({
+                state: {
+                  ...cur,
+                  timerEndsAt: data.timerEndsAt ?? cur.timerEndsAt,
+                  turnEndsAt: data.turnEndsAt ?? cur.turnEndsAt
+                }
+              });
+            }
+          } else if (data.type === "timer_warning") {
+            set({ timerWarning: true });
           } else if (data.type === "error") {
             set({ error: data.message });
           }
@@ -164,7 +181,8 @@ export const useGameStore = create<GameStore>((set, get) => ({
     set({
       status: "disconnected",
       state: null,
-      socket: null
+      socket: null,
+      timerWarning: false
     });
   }
 }));

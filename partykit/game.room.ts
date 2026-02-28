@@ -8,10 +8,11 @@ import {
   type ServerEvent
 } from "../shared/event.contracts";
 import {
-  CLUE_SECONDS,
+  computeClueSeconds,
   DISCONNECT_GRACE_MS,
   GUESS_SECONDS,
   VOTING_SECONDS,
+  TURN_SECONDS,
   createInitialState,
   isActionAllowed,
   pickImposter,
@@ -28,6 +29,12 @@ export default class GameRoom implements Party.Server {
 
   state: GameState = createInitialState();
   private phaseTimer: TimerHandle = null;
+  /** Timer that auto-advances the current clue turn when a player is idle */
+  private turnTimer: TimerHandle = null;
+  /** Interval that re-broadcasts timerEndsAt so clients stay in sync */
+  private syncInterval: TimerHandle = null;
+  /** Timer that fires a warning broadcast 10 seconds before the phase ends */
+  private warningTimer: TimerHandle = null;
   private disconnectTimers = new Map<string, TimerHandle>();
   private turnOrder: string[] = [];
 
@@ -187,9 +194,10 @@ export default class GameRoom implements Party.Server {
       return;
     }
 
-    const playerCount = Object.values(this.state.players).filter(
+    const connectedPlayers = Object.values(this.state.players).filter(
       (p) => p.connected
-    ).length;
+    );
+    const playerCount = connectedPlayers.length;
 
     if (playerCount < 4) {
       this.sendError(connection, "Need at least 4 players to start");
@@ -214,16 +222,23 @@ export default class GameRoom implements Party.Server {
     this.turnOrder = Object.keys(this.state.players);
     this.state.currentTurnPlayerId = this.getNextTurnPlayerId();
 
+    // Dynamic round duration: every player gets TURN_SECONDS + 15 s buffer
+    const clueSeconds = computeClueSeconds(playerCount);
+
     this.state.phase = "clue";
     this.state.round = 1;
     this.state.clues[1] = {};
     this.state.votes = {};
-    this.state.timerEndsAt = this.futureTimestampSeconds(CLUE_SECONDS);
+    this.state.timerEndsAt = this.futureMs(clueSeconds * 1000);
+    this.state.turnEndsAt = this.futureMs(TURN_SECONDS * 1000);
     this.state.categoryId = category;
 
     this.broadcastPhaseChanged("clue");
     this.broadcastStateToAll();
-    this.schedulePhaseTimer("clue", CLUE_SECONDS);
+    this.schedulePhaseTimer("clue", this.state.timerEndsAt);
+    this.scheduleTurnTimer();
+    this.startSyncInterval();
+    this.scheduleWarningBroadcast(this.state.timerEndsAt);
   }
 
   private handleSubmitClue(connection: Party.Connection, clue: string) {
@@ -354,27 +369,41 @@ export default class GameRoom implements Party.Server {
   }
 
   private advanceFromClue() {
+    this.clearTurnTimer();
     const nextRound = this.state.round + 1;
     if (nextRound <= this.state.maxRounds) {
+      // Recompute based on currently connected players for the new round
+      const playerCount = Object.values(this.state.players).filter(
+        (p) => p.connected
+      ).length;
+      const clueSeconds = computeClueSeconds(playerCount);
+
       this.state.round = nextRound;
       this.state.clues[nextRound] = {};
-      this.state.timerEndsAt = this.futureTimestampSeconds(CLUE_SECONDS);
+      this.state.timerEndsAt = this.futureMs(clueSeconds * 1000);
+      this.state.turnEndsAt = this.futureMs(TURN_SECONDS * 1000);
       this.state.currentTurnPlayerId = this.getNextTurnPlayerId();
       this.broadcastPhaseChanged("clue");
       this.broadcastStateToAll();
-      this.schedulePhaseTimer("clue", CLUE_SECONDS);
+      this.schedulePhaseTimer("clue", this.state.timerEndsAt);
+      this.scheduleTurnTimer();
+      this.scheduleWarningBroadcast(this.state.timerEndsAt);
     } else {
       this.state.phase = "voting";
       this.state.votes = {};
-      this.state.timerEndsAt = this.futureTimestampSeconds(VOTING_SECONDS);
+      this.state.timerEndsAt = this.futureMs(VOTING_SECONDS * 1000);
+      this.state.turnEndsAt = undefined;
       this.state.currentTurnPlayerId = undefined;
       this.broadcastPhaseChanged("voting");
       this.broadcastStateToAll();
-      this.schedulePhaseTimer("voting", VOTING_SECONDS);
+      this.schedulePhaseTimer("voting", this.state.timerEndsAt);
+      this.scheduleWarningBroadcast(this.state.timerEndsAt);
     }
   }
 
   private resolveVoting() {
+    this.stopSyncInterval();
+    this.clearWarningTimer();
     const tally: Record<string, number> = {};
     for (const target of Object.values(this.state.votes)) {
       tally[target] = (tally[target] ?? 0) + 1;
@@ -412,16 +441,23 @@ export default class GameRoom implements Party.Server {
     }
 
     this.state.phase = "guess";
-    this.state.timerEndsAt = this.futureTimestampSeconds(GUESS_SECONDS);
+    this.state.timerEndsAt = this.futureMs(GUESS_SECONDS * 1000);
+    this.state.turnEndsAt = undefined;
     this.broadcastPhaseChanged("guess");
     this.broadcastStateToAll();
-    this.schedulePhaseTimer("guess", GUESS_SECONDS);
+    this.schedulePhaseTimer("guess", this.state.timerEndsAt);
+    this.startSyncInterval();
+    this.scheduleWarningBroadcast(this.state.timerEndsAt);
   }
 
   private finishGame(result: GameResult) {
     this.clearPhaseTimer();
+    this.clearTurnTimer();
+    this.stopSyncInterval();
+    this.clearWarningTimer();
     this.state.phase = "finished";
     this.state.timerEndsAt = undefined;
+    this.state.turnEndsAt = undefined;
 
     const event: ServerEvent = {
       type: "game_finished",
@@ -432,10 +468,14 @@ export default class GameRoom implements Party.Server {
     this.broadcastStateToAll();
   }
 
-  private schedulePhaseTimer(phase: Phase, seconds: number) {
+  /**
+   * Schedule the phase-end timer.
+   * @param phase   — which phase this timer belongs to
+   * @param endsAt  — absolute epoch ms when the phase should end
+   */
+  private schedulePhaseTimer(phase: Phase, endsAt: number) {
     this.clearPhaseTimer();
-    const expectedEnd = this.state.timerEndsAt ?? this.futureTimestampSeconds(seconds);
-    this.state.timerEndsAt = expectedEnd;
+    const delay = Math.max(0, endsAt - Date.now());
 
     this.phaseTimer = setTimeout(() => {
       if (this.state.phase !== phase) return;
@@ -453,13 +493,93 @@ export default class GameRoom implements Party.Server {
         default:
           break;
       }
-    }, seconds * 1000);
+    }, delay);
   }
 
   private clearPhaseTimer() {
     if (this.phaseTimer) {
       clearTimeout(this.phaseTimer);
       this.phaseTimer = null;
+    }
+  }
+
+  private scheduleTurnTimer() {
+    this.clearTurnTimer();
+    const expectedPlayerId = this.state.currentTurnPlayerId;
+    const endsAt = this.futureMs(TURN_SECONDS * 1000);
+    this.state.turnEndsAt = endsAt;
+
+    this.turnTimer = setTimeout(() => {
+      if (this.state.phase !== "clue") return;
+      if (this.state.currentTurnPlayerId !== expectedPlayerId) return;
+
+      // Auto-advance turn (skip current player for this round)
+      this.advanceClueTurn();
+    }, TURN_SECONDS * 1000);
+  }
+
+  private clearTurnTimer() {
+    if (this.turnTimer) {
+      clearTimeout(this.turnTimer);
+      this.turnTimer = null;
+    }
+  }
+
+  private startSyncInterval() {
+    this.stopSyncInterval();
+    this.syncInterval = setInterval(() => {
+      if (
+        this.state.phase === "finished" ||
+        this.state.phase === "lobby"
+      ) {
+        this.stopSyncInterval();
+        return;
+      }
+      this.broadcastTimerSync();
+    }, 5000) as unknown as TimerHandle;
+  }
+
+  private stopSyncInterval() {
+    if (this.syncInterval) {
+      clearInterval(this.syncInterval as unknown as ReturnType<typeof setInterval>);
+      this.syncInterval = null;
+    }
+  }
+
+
+  private broadcastTimerSync() {
+    const event: ServerEvent = {
+      type: "timer_sync",
+      timerEndsAt: this.state.timerEndsAt,
+      turnEndsAt: this.state.turnEndsAt
+    };
+    this.room.broadcast(serialize(event));
+  }
+
+
+  private scheduleWarningBroadcast(endsAt: number) {
+    this.clearWarningTimer();
+    const WARNING_MS = 10_000;
+    const delay = Math.max(0, endsAt - Date.now() - WARNING_MS);
+
+    this.warningTimer = setTimeout(() => {
+      if (
+        this.state.phase === "finished" ||
+        this.state.phase === "lobby"
+      )
+        return;
+      const event: ServerEvent = {
+        type: "timer_warning",
+        secondsLeft: Math.round(Math.max(0, (endsAt - Date.now()) / 1000))
+      };
+      this.room.broadcast(serialize(event));
+    }, delay);
+  }
+
+  private clearWarningTimer() {
+    if (this.warningTimer) {
+      clearTimeout(this.warningTimer);
+      this.warningTimer = null;
     }
   }
 
@@ -501,6 +621,7 @@ export default class GameRoom implements Party.Server {
   }
 
   private advanceClueTurn() {
+    this.clearTurnTimer();
     const round = this.state.round;
     const currentId = this.state.currentTurnPlayerId;
     const startIndex = currentId
@@ -517,7 +638,9 @@ export default class GameRoom implements Party.Server {
       const hasClue = this.state.clues[round]?.[id];
       if (!hasClue) {
         this.state.currentTurnPlayerId = id;
+        this.state.turnEndsAt = this.futureMs(TURN_SECONDS * 1000);
         this.broadcastStateToAll();
+        this.scheduleTurnTimer();
         return;
       }
     }
@@ -554,8 +677,7 @@ export default class GameRoom implements Party.Server {
     connection.send(serialize(event));
   }
 
-  private futureTimestampSeconds(seconds: number): number {
-    return Date.now() + seconds * 1000;
+  private futureMs(ms: number): number {
+    return Date.now() + ms;
   }
 }
-

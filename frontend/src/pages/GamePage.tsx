@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useGameStore } from "../hooks/useGameStore";
 import type {
   Phase,
@@ -6,10 +6,39 @@ import type {
   WordCategoryId
 } from "../../../shared/event.contracts";
 
+function useCountdown(endsAt: number | undefined): number | undefined {
+  const [remaining, setRemaining] = useState<number | undefined>(undefined);
+  const rafRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!endsAt) {
+      setRemaining(undefined);
+      return;
+    }
+
+    const tick = () => {
+      const ms = endsAt - Date.now();
+      setRemaining(Math.max(0, Math.round(ms / 1000)));
+      if (ms > 0) {
+        rafRef.current = requestAnimationFrame(tick);
+      }
+    };
+
+    tick();
+    return () => {
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+    };
+  }, [endsAt]);
+
+  return remaining;
+}
+
 const PhasePill: React.FC<{ phase: Phase; timerEndsAt?: number }> = ({
   phase,
   timerEndsAt
 }) => {
+  const remaining = useCountdown(timerEndsAt);
+
   const label =
     phase === "lobby"
       ? "Lobby"
@@ -21,19 +50,78 @@ const PhasePill: React.FC<{ phase: Phase; timerEndsAt?: number }> = ({
       ? "Imposter guess"
       : "Finished";
 
-  let remaining: number | undefined;
-  if (timerEndsAt) {
-    const ms = timerEndsAt - Date.now();
-    remaining = Math.max(0, Math.round(ms / 1000));
-  }
+  const isUrgent = typeof remaining === "number" && remaining <= 10 && remaining > 0;
 
   return (
     <div className="badge badge-outline gap-2">
-      <span className="inline-block h-2 w-2 rounded-full bg-success" />
+      <span
+        className={`inline-block h-2 w-2 rounded-full ${
+          isUrgent ? "bg-error animate-pulse" : "bg-success"
+        }`}
+      />
       <span>{label}</span>
       {typeof remaining === "number" && remaining > 0 && (
-        <span className="badge badge-ghost badge-sm">{remaining}s</span>
+        <span
+          className={`badge badge-sm ${
+            isUrgent ? "badge-error" : "badge-ghost"
+          }`}
+        >
+          {remaining}s
+        </span>
       )}
+    </div>
+  );
+};
+
+const TimerWarningBanner: React.FC<{ secondsLeft?: number }> = ({
+  secondsLeft
+}) => {
+  return (
+    <div className="alert alert-warning shadow-md animate-bounce-once">
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        className="h-5 w-5 shrink-0 stroke-current"
+        fill="none"
+        viewBox="0 0 24 24"
+      >
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth="2"
+          d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+        />
+      </svg>
+      <span className="font-semibold">
+        ⏰ Hurry!{" "}
+        {typeof secondsLeft === "number"
+          ? `~${secondsLeft} seconds`
+          : "Time"}{" "}
+        left for this phase!
+      </span>
+    </div>
+  );
+};
+
+const TurnTimer: React.FC<{
+  isMyTurn: boolean;
+  turnEndsAt?: number;
+}> = ({ isMyTurn, turnEndsAt }) => {
+  const remaining = useCountdown(turnEndsAt);
+
+  if (typeof remaining !== "number" || remaining <= 0) return null;
+
+  const isUrgent = remaining <= 7;
+
+  return (
+    <div
+      className={`flex items-center gap-2 rounded-box px-3 py-1 text-sm font-semibold ${
+        isUrgent
+          ? "bg-error text-error-content animate-pulse"
+          : "bg-warning text-warning-content"
+      }`}
+    >
+      <span>{isMyTurn ? "Your turn ends in" : "Turn ends in"}</span>
+      <span className="tabular-nums">{remaining}s</span>
     </div>
   );
 };
@@ -48,9 +136,12 @@ export const GamePage: React.FC = () => {
   const submitVote = useGameStore((s) => s.submitVote);
   const submitImposterGuess = useGameStore((s) => s.submitImposterGuess);
   const leave = useGameStore((s) => s.leave);
+  const timerWarning = useGameStore((s) => s.timerWarning);
 
   const [clue, setClue] = useState("");
   const [guess, setGuess] = useState("");
+
+  const phaseRemaining = useCountdown(state?.timerEndsAt);
 
   const me: Player | undefined = useMemo(
     () => (state ? state.players[playerId ?? ""] : undefined),
@@ -118,6 +209,12 @@ export const GamePage: React.FC = () => {
         </button>
       </header>
 
+      {timerWarning &&
+        state.phase !== "lobby" &&
+        state.phase !== "finished" && (
+          <TimerWarningBanner secondsLeft={phaseRemaining} />
+        )}
+
       <section className="card bg-base-100 shadow">
         <div className="card-body p-5">
           <div className="mb-2 flex items-center justify-between gap-3">
@@ -161,6 +258,12 @@ export const GamePage: React.FC = () => {
                         You
                       </span>
                     )}
+                    {state.phase === "clue" &&
+                      state.currentTurnPlayerId === p.id && (
+                        <span className="badge badge-warning badge-sm ml-2">
+                          Turn ▶
+                        </span>
+                      )}
                   </span>
                   <span className="text-xs opacity-70">
                     {p.connected ? "Connected" : "Reconnecting…"}
@@ -177,9 +280,12 @@ export const GamePage: React.FC = () => {
       {state.phase === "clue" && (
         <section className="card bg-base-100 shadow">
           <div className="card-body p-5">
-            <h2 className="card-title text-base">
-              Round {state.round}: clues
-            </h2>
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="card-title text-base">
+                Round {state.round}: clues
+              </h2>
+              <TurnTimer isMyTurn={isMyTurn} turnEndsAt={state.turnEndsAt} />
+            </div>
 
             {currentTurnPlayer && (
               <p className="text-sm opacity-70">
@@ -329,6 +435,17 @@ export const GamePage: React.FC = () => {
           >
             Submit guess
           </button>
+          </div>
+        </section>
+      )}
+
+      {state.phase === "guess" && !me?.isImposter && (
+        <section className="card bg-base-200 shadow">
+          <div className="card-body p-5">
+            <h2 className="card-title text-base">Waiting…</h2>
+            <p className="text-sm opacity-70">
+              The imposter is making their final guess. Hang tight!
+            </p>
           </div>
         </section>
       )}

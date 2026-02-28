@@ -21,6 +21,7 @@ export interface GameState {
   votes: Record<string, string>;
   clues: Record<number, Record<string, string>>;
   timerEndsAt?: number;
+  turnEndsAt?: number;
   selfId?: string;
   currentTurnPlayerId?: string;
 }
@@ -41,5 +42,6 @@ export type ServerEvent =
   | { type: "player_left"; playerId: string }
   | { type: "phase_changed"; phase: Phase }
   | { type: "game_finished"; result: GameResult }
-  | { type: "error"; message: string };
-
+  | { type: "error"; message: string }
+  | { type: "timer_sync"; timerEndsAt?: number; turnEndsAt?: number }
+  | { type: "timer_warning"; secondsLeft: number };
