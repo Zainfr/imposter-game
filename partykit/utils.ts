@@ -3,6 +3,7 @@ import type { GameState, Player, Phase } from "../shared/event.contracts";
 export const TURN_SECONDS = 60;
 export const VOTING_SECONDS = 60;
 export const GUESS_SECONDS = 40;
+export const ROUND_END_SECONDS = 5;
 export const DISCONNECT_GRACE_MS = 2 * 60 * 1000;
 
 export function computeClueSeconds(playerCount: number): number {

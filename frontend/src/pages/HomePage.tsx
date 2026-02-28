@@ -26,7 +26,12 @@ export const HomePage: React.FC = () => {
   const handleJoinOrQuickPlay = () => {
     const existing = roomCode.trim();
     const code = existing || randomRoomId();
+    // navigateToRoom calls setRoomCode — but that is async state.
+    // Pass the resolved code directly to connectAndJoin so the new
+    // room code is definitely picked up even on quick play.
     navigateToRoom(code);
+    // Sync the store immediately before connectAndJoin reads it
+    useGameStore.setState({ roomCode: code });
     connectAndJoin();
   };
 

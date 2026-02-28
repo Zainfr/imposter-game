@@ -13,13 +13,14 @@ import {
   GUESS_SECONDS,
   VOTING_SECONDS,
   TURN_SECONDS,
+  ROUND_END_SECONDS,
   createInitialState,
   isActionAllowed,
   pickImposter,
   serialize
 } from "./utils";
 import { WordService } from "./word.service";
-import type { WordCategoryId } from "../shared/event.contracts";
+import type { RoundEndReason, WordCategoryId } from "../shared/event.contracts";
 
 type TimerHandle = ReturnType<typeof setTimeout> | null;
 
@@ -53,16 +54,19 @@ export default class GameRoom implements Party.Server {
   onConnect(connection: Party.Connection) {
     const existing = this.state.players[connection.id];
     if (existing) {
+      // Reconnection — restore connected flag and cancel removal timer
       this.clearDisconnectTimer(connection.id);
       this.state.players[connection.id] = {
         ...existing,
         connected: true
       };
-      this.sendState(connection);
+      this.broadcastStateToAll();
       return;
     }
 
-    if (this.state.phase !== "lobby") {
+    // Brand-new socket in a non-lobby room: reject unless the game is finished
+    // (finished rooms allow a spectator view while waiting for a reset).
+    if (this.state.phase !== "lobby" && this.state.phase !== "finished") {
       this.sendEvent(connection, {
         type: "error",
         message: "Game already started"
@@ -71,23 +75,10 @@ export default class GameRoom implements Party.Server {
       return;
     }
 
-    const player: Player = {
-      id: connection.id,
-      name: "Player",
-      isImposter: false,
-      score: 0,
-      connected: true
-    };
-
-    this.state.players[player.id] = player;
-
-    const joinEvent: ServerEvent = {
-      type: "player_joined",
-      player
-    };
-
-    this.room.broadcast(serialize(joinEvent));
-    this.broadcastStateToAll();
+    // Just send current state — do NOT add the player yet.
+    // The client will immediately send a {type:"join",name:"..."} message
+    // which is where the player entry is actually created.
+    this.sendState(connection);
   }
 
   onMessage(message: string, sender: Party.Connection) {
@@ -126,6 +117,10 @@ export default class GameRoom implements Party.Server {
   onClose(connection: Party.Connection) {
     const player = this.state.players[connection.id];
     if (!player) return;
+
+    // Cancel any existing grace timer before starting a new one
+    // (e.g. rapid disconnect → reconnect → disconnect again)
+    this.clearDisconnectTimer(connection.id);
 
     this.state.players[connection.id] = {
       ...player,
@@ -204,7 +199,12 @@ export default class GameRoom implements Party.Server {
       return;
     }
 
-    const imposterId = pickImposter(this.state.players);
+    // Only pick from players who are actually connected right now
+    const connectedPlayerIds = Object.values(this.state.players)
+      .filter((p) => p.connected)
+      .reduce((acc, p) => { acc[p.id] = p; return acc; }, {} as Record<string, Player>);
+
+    const imposterId = pickImposter(connectedPlayerIds);
     if (!imposterId) {
       this.sendError(connection, "Unable to assign imposter");
       return;
@@ -364,11 +364,62 @@ export default class GameRoom implements Party.Server {
   }
 
   private handleLeave(connection: Party.Connection) {
-    this.removePlayer(connection.id);
+    const player = this.state.players[connection.id];
+    if (!player) {
+      connection.close();
+      return;
+    }
+
+    if (this.state.phase === "lobby" || this.state.phase === "finished") {
+      // In lobby/finished, a leave is permanent — remove immediately.
+      this.removePlayer(connection.id);
+    } else {
+      // During an active game, treat the leave the same as a network drop.
+      // Cancel any existing grace timer first to avoid double-removePlayer.
+      this.clearDisconnectTimer(connection.id);
+
+      this.state.players[connection.id] = { ...player, connected: false };
+
+      const leaveEvent: ServerEvent = {
+        type: "player_left",
+        playerId: connection.id
+      };
+      this.room.broadcast(serialize(leaveEvent));
+      this.broadcastStateToAll();
+
+      const timer = setTimeout(() => {
+        this.disconnectTimers.delete(connection.id);
+        this.removePlayer(connection.id);
+      }, DISCONNECT_GRACE_MS);
+      this.disconnectTimers.set(connection.id, timer);
+    }
+
     connection.close();
   }
 
-  private advanceFromClue() {
+
+  private startRoundCooldown(reason: RoundEndReason) {
+    this.clearPhaseTimer();
+    this.clearTurnTimer();
+    this.clearWarningTimer();
+    this.stopSyncInterval();
+
+    this.state.phase = "round_end";
+    this.state.timerEndsAt = this.futureMs(ROUND_END_SECONDS * 1000);
+    this.state.turnEndsAt = undefined;
+    this.state.currentTurnPlayerId = undefined;
+    this.state.roundEndReason = reason;
+
+    this.broadcastPhaseChanged("round_end");
+    this.broadcastStateToAll();
+
+    this.phaseTimer = setTimeout(() => {
+      if (this.state.phase !== "round_end") return;
+      this.doAdvanceFromClue();
+    }, ROUND_END_SECONDS * 1000);
+  }
+
+  private doAdvanceFromClue() {
     this.clearTurnTimer();
     const nextRound = this.state.round + 1;
     if (nextRound <= this.state.maxRounds) {
@@ -378,26 +429,31 @@ export default class GameRoom implements Party.Server {
       ).length;
       const clueSeconds = computeClueSeconds(playerCount);
 
+      this.state.phase = "clue"; // Set phase BEFORE broadcast
       this.state.round = nextRound;
       this.state.clues[nextRound] = {};
       this.state.timerEndsAt = this.futureMs(clueSeconds * 1000);
       this.state.turnEndsAt = this.futureMs(TURN_SECONDS * 1000);
       this.state.currentTurnPlayerId = this.getNextTurnPlayerId();
+      this.state.roundEndReason = undefined;
       this.broadcastPhaseChanged("clue");
       this.broadcastStateToAll();
       this.schedulePhaseTimer("clue", this.state.timerEndsAt);
       this.scheduleTurnTimer();
       this.scheduleWarningBroadcast(this.state.timerEndsAt);
+      this.startSyncInterval();
     } else {
       this.state.phase = "voting";
-      this.state.votes = {};
+      this.state.votes = {}; // Always reset votes cleanly
       this.state.timerEndsAt = this.futureMs(VOTING_SECONDS * 1000);
       this.state.turnEndsAt = undefined;
       this.state.currentTurnPlayerId = undefined;
+      this.state.roundEndReason = undefined;
       this.broadcastPhaseChanged("voting");
       this.broadcastStateToAll();
       this.schedulePhaseTimer("voting", this.state.timerEndsAt);
       this.scheduleWarningBroadcast(this.state.timerEndsAt);
+      this.startSyncInterval();
     }
   }
 
@@ -441,6 +497,7 @@ export default class GameRoom implements Party.Server {
     }
 
     this.state.phase = "guess";
+    this.state.votes = {}; // Clear votes — not needed after resolution
     this.state.timerEndsAt = this.futureMs(GUESS_SECONDS * 1000);
     this.state.turnEndsAt = undefined;
     this.broadcastPhaseChanged("guess");
@@ -482,7 +539,7 @@ export default class GameRoom implements Party.Server {
 
       switch (phase) {
         case "clue":
-          this.advanceFromClue();
+          this.startRoundCooldown("time_up");
           break;
         case "voting":
           this.resolveVoting();
@@ -565,7 +622,8 @@ export default class GameRoom implements Party.Server {
     this.warningTimer = setTimeout(() => {
       if (
         this.state.phase === "finished" ||
-        this.state.phase === "lobby"
+        this.state.phase === "lobby" ||
+        this.state.phase === "round_end" // warning during cooldown is confusing
       )
         return;
       const event: ServerEvent = {
@@ -589,7 +647,14 @@ export default class GameRoom implements Party.Server {
 
     delete this.state.players[playerId];
 
-    if (Object.keys(this.state.players).length < 2) {
+    // Only end the game if there are fewer than 2 players who are still
+    // connected (i.e. actively in the room). Disconnected players in their
+    // grace period are not counted so a temporary drop doesn't kill the game.
+    const connectedCount = Object.values(this.state.players).filter(
+      (p) => p.connected
+    ).length;
+
+    if (connectedCount < 2 && Object.keys(this.state.players).length < 2) {
       this.finishGame("imposter");
     } else {
       this.broadcastStateToAll();
@@ -633,6 +698,8 @@ export default class GameRoom implements Party.Server {
       const idx = (startIndex + i) % total;
       const id = this.turnOrder[idx];
       const player = this.state.players[id];
+
+      // Skip players who have disconnected or are no longer in the game
       if (!player || !player.connected) continue;
 
       const hasClue = this.state.clues[round]?.[id];
@@ -645,8 +712,8 @@ export default class GameRoom implements Party.Server {
       }
     }
 
-    // Everyone has given a clue for this round
-    this.advanceFromClue();
+    // All connected players have submitted — enter 5-second cooldown
+    this.startRoundCooldown("all_submitted");
   }
 
   private clearDisconnectTimer(playerId: string) {

@@ -38,6 +38,7 @@ function getOrCreatePlayerId(): string {
   if (typeof window === "undefined") return crypto.randomUUID();
 
   // Use sessionStorage so each browser tab gets its own player id.
+  // We store it once per tab; clearing is done explicitly on a fresh join.
   try {
     const existing = window.sessionStorage.getItem(PLAYER_ID_KEY);
     if (existing) return existing;
@@ -45,9 +46,17 @@ function getOrCreatePlayerId(): string {
     window.sessionStorage.setItem(PLAYER_ID_KEY, id);
     return id;
   } catch {
-    // Fallback if storage is unavailable
     return crypto.randomUUID();
   }
+}
+
+/** Generate and persist a brand-new player ID (used when entering a new room) */
+function refreshPlayerId(): string {
+  const id = crypto.randomUUID();
+  try {
+    window.sessionStorage.setItem(PLAYER_ID_KEY, id);
+  } catch { /* ignore */ }
+  return id;
 }
 
 export const useGameStore = create<GameStore>((set, get) => ({
@@ -81,7 +90,10 @@ export const useGameStore = create<GameStore>((set, get) => ({
       socket.close();
     }
 
-    const playerId = getOrCreatePlayerId();
+    // Always generate a fresh ID when joining.  Re-using a stale ID from a
+    // previous room would cause the new room's server to treat this socket as
+    // a "reconnection" of an unknown player.
+    const playerId = refreshPlayerId();
 
     set({
       status: "connecting",
@@ -172,15 +184,23 @@ export const useGameStore = create<GameStore>((set, get) => ({
   },
 
   leave() {
-    const { socket } = get();
+    const { socket, state } = get();
     if (socket) {
-      const event: ClientEvent = { type: "leave" };
-      socket.send(JSON.stringify(event));
-      socket.close();
+      // Send leave event and give the server a moment to process it before
+      // closing the socket — avoids the race where the socket closes before
+      // the leave message is delivered.
+      try {
+        const event: ClientEvent = { type: "leave" };
+        socket.send(JSON.stringify(event));
+      } catch { /* socket may already be closing */ }
+
+      setTimeout(() => socket.close(), 150);
     }
     set({
       status: "disconnected",
-      state: null,
+      // Preserve the final game state on the finished screen so players can
+      // see results. Only clear it when they navigate back to home.
+      state: state?.phase === "finished" ? state : null,
       socket: null,
       timerWarning: false
     });

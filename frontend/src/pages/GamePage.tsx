@@ -3,6 +3,7 @@ import { useGameStore } from "../hooks/useGameStore";
 import type {
   Phase,
   Player,
+  RoundEndReason,
   WordCategoryId
 } from "../../../shared/event.contracts";
 
@@ -33,22 +34,34 @@ function useCountdown(endsAt: number | undefined): number | undefined {
   return remaining;
 }
 
-const PhasePill: React.FC<{ phase: Phase; timerEndsAt?: number }> = ({
-  phase,
-  timerEndsAt
-}) => {
-  const remaining = useCountdown(timerEndsAt);
+const PhasePill: React.FC<{
+  phase: Phase;
+  timerEndsAt?: number;
+  round?: number;
+  maxRounds?: number;
+}> = ({ phase, timerEndsAt, round, maxRounds }) => {
 
-  const label =
+  const showTimer = phase === "voting" || phase === "guess" || phase === "round_end";
+  const remaining = useCountdown(showTimer ? timerEndsAt : undefined);
+
+  const baseLabel =
     phase === "lobby"
       ? "Lobby"
       : phase === "clue"
       ? "Clue"
+      : phase === "round_end"
+      ? "Round ending"
       : phase === "voting"
       ? "Voting"
       : phase === "guess"
       ? "Imposter guess"
       : "Finished";
+
+  // Append round progress during the clue phase
+  const label =
+    phase === "clue" && round != null && maxRounds != null
+      ? `${baseLabel} · Round ${round}/${maxRounds}`
+      : baseLabel;
 
   const isUrgent = typeof remaining === "number" && remaining <= 10 && remaining > 0;
 
@@ -126,6 +139,100 @@ const TurnTimer: React.FC<{
   );
 };
 
+const RoundEndOverlay: React.FC<{
+  round: number;
+  maxRounds: number;
+  reason: RoundEndReason | undefined;
+  timerEndsAt: number | undefined;
+  clues: Record<string, string>;
+  players: Record<string, { name: string }>;
+}> = ({ round, maxRounds, reason, timerEndsAt, clues, players }) => {
+  const remaining = useCountdown(timerEndsAt);
+  const isLastRound = round >= maxRounds;
+
+  const headlineIcon = reason === "all_submitted" ? "✅" : "⏰";
+  const headlineText =
+    reason === "all_submitted" ? "All clues in!" : "Time's up!";
+  const nextLabel = isLastRound ? "Voting starts" : `Round ${round + 1} starts`;
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 50,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        background: "rgba(0,0,0,0.82)",
+        backdropFilter: "blur(6px)",
+        padding: "1.5rem"
+      }}
+    >
+      <p className="text-lg font-semibold text-base-content opacity-90 mb-1">
+        {headlineIcon} {headlineText}
+      </p>
+
+      <div
+        key={remaining}
+        style={{
+          fontSize: "clamp(5rem, 20vw, 9rem)",
+          fontWeight: 800,
+          lineHeight: 1,
+          color: (remaining ?? 0) <= 2 ? "#f87272" : "#a3e635",
+          animation: "pulse 0.9s ease-in-out"
+        }}
+      >
+        {remaining ?? "…"}
+      </div>
+
+      <p className="mt-2 text-sm font-medium text-base-content opacity-70">
+        {nextLabel} in {remaining ?? "…"} second{remaining !== 1 ? "s" : ""}
+      </p>
+
+      {Object.entries(clues).length > 0 && (
+        <div
+          style={{
+            marginTop: "1.5rem",
+            width: "100%",
+            maxWidth: 420,
+            maxHeight: "35vh",
+            overflowY: "auto",
+            background: "rgba(255,255,255,0.06)",
+            borderRadius: "1rem",
+            padding: "0.75rem"
+          }}
+        >
+          <p className="text-xs font-semibold opacity-50 mb-2 uppercase tracking-widest">
+            Round {round} clues
+          </p>
+          <div className="flex flex-col gap-2">
+            {Object.entries(clues).map(([pid, clueText]) => {
+              const pName = players[pid]?.name ?? "Unknown";
+              return (
+                <div
+                  key={pid}
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    background: "rgba(255,255,255,0.08)",
+                    borderRadius: "0.5rem",
+                    padding: "0.5rem 0.75rem"
+                  }}
+                >
+                  <span className="text-xs font-semibold opacity-60">{pName}</span>
+                  <span className="text-sm font-medium">{clueText}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 export const GamePage: React.FC = () => {
   const state = useGameStore((s) => s.state);
   const name = useGameStore((s) => s.name);
@@ -181,12 +288,30 @@ export const GamePage: React.FC = () => {
 
   return (
     <div className="flex h-full flex-col gap-4 pt-4">
+      {state.phase === "round_end" && (
+        <RoundEndOverlay
+          round={state.round}
+          maxRounds={state.maxRounds}
+          reason={state.roundEndReason}
+          timerEndsAt={state.timerEndsAt}
+          clues={state.clues[state.round] ?? {}}
+          players={state.players}
+        />
+      )}
+
       <header className="flex items-start justify-between gap-3">
         <div className="space-y-1">
           <div className="text-xs opacity-70">Room</div>
           <div className="text-xl font-bold tracking-widest">{roomCode}</div>
           <div className="flex flex-wrap items-center gap-2">
-            <PhasePill phase={state.phase} timerEndsAt={state.timerEndsAt} />
+            <PhasePill
+              phase={state.phase}
+              timerEndsAt={state.timerEndsAt}
+              round={state.round || undefined}
+              maxRounds={state.maxRounds}
+            />
+
+
             {me?.isImposter ? (
               <div className="badge badge-error badge-outline">Imposter</div>
             ) : state.secretWord ? (
@@ -453,15 +578,55 @@ export const GamePage: React.FC = () => {
       {state.phase === "finished" && (
         <section className="card bg-base-100 shadow">
           <div className="card-body p-5">
-          <h2 className="card-title text-base">
-            Game finished
-          </h2>
-          <p className="text-sm opacity-70">
-            Start a fresh room from the home screen to play again.
-          </p>
+            <h2 className="card-title text-base">🏁 Game over</h2>
+
+            {/* Final scores */}
+            <ul className="mt-3 flex flex-col gap-2 text-sm">
+              {Object.values(state.players)
+                .sort((a, b) => b.score - a.score)
+                .map((p, i) => (
+                  <li
+                    key={p.id}
+                    className="flex items-center justify-between rounded-box bg-base-200 px-3 py-2"
+                  >
+                    <span className="flex items-center gap-2">
+                      <span className="text-xs font-bold opacity-50 w-4">
+                        {i + 1}.
+                      </span>
+                      <span className={p.id === playerId ? "font-semibold" : ""}>
+                        {p.name}
+                        {p.id === playerId && (
+                          <span className="badge badge-secondary badge-outline badge-xs ml-1">
+                            You
+                          </span>
+                        )}
+                        {p.isImposter && (
+                          <span className="badge badge-error badge-outline badge-xs ml-1">
+                            Imposter
+                          </span>
+                        )}
+                      </span>
+                    </span>
+                    <span className="badge badge-outline">{p.score} pts</span>
+                  </li>
+                ))}
+            </ul>
+
+            <button
+              type="button"
+              className="btn btn-primary w-full mt-4"
+              onClick={() => {
+                // Clear the preserved finished state and navigate to home
+                useGameStore.setState({ state: null, error: undefined });
+                window.history.pushState({}, "", "/");
+              }}
+            >
+              Play again
+            </button>
           </div>
         </section>
       )}
+
 
       <section className="mt-auto text-xs opacity-70">
         Playing as{" "}

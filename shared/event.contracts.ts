@@ -1,4 +1,5 @@
-export type Phase = "lobby" | "clue" | "voting" | "guess" | "finished";
+export type Phase = "lobby" | "clue" | "round_end" | "voting" | "guess" | "finished";
+export type RoundEndReason = "all_submitted" | "time_up";
 
 export type WordCategoryId = "clash_royale" | "animals" | "countries";
 
@@ -24,6 +25,7 @@ export interface GameState {
   turnEndsAt?: number;
   selfId?: string;
   currentTurnPlayerId?: string;
+  roundEndReason?: RoundEndReason;
 }
 
 export type ClientEvent =
