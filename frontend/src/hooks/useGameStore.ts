@@ -120,6 +120,35 @@ export const useGameStore = create<GameStore>((set, get) => ({
             const selfId = data.state.selfId ?? null;
             // Clear warning when a fresh state arrives (phase may have changed)
             set({ state: data.state, playerId: selfId, timerWarning: false });
+          } else if (data.type === "player_joined") {
+            const cur = get().state;
+            if (cur) {
+              set({
+                state: {
+                  ...cur,
+                  players: {
+                    ...cur.players,
+                    [data.player.id]: data.player
+                  }
+                }
+              });
+            }
+          } else if (data.type === "player_left") {
+            const cur = get().state;
+            if (cur && cur.players[data.playerId]) {
+              set({
+                state: {
+                  ...cur,
+                  players: {
+                    ...cur.players,
+                    [data.playerId]: {
+                      ...cur.players[data.playerId]!,
+                      connected: false
+                    }
+                  }
+                }
+              });
+            }
           } else if (data.type === "timer_sync") {
             // Patch only the timer fields to avoid full re-render
             const cur = get().state;

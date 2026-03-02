@@ -44,7 +44,7 @@ export default class GameRoom implements Party.Server {
   }
 
   readonly options: Party.ServerOptions = {
-    hibernate: true
+    hibernate: false
   };
 
   onStart() {
