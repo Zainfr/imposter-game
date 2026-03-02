@@ -34,7 +34,7 @@ const App: React.FC = () => {
         <div className="flex-1 min-w-0">
           <div className="flex flex-col leading-tight">
             <span className="text-[10px] font-bold uppercase tracking-widest text-accent">
-              Imposter Clue
+              SusBabyGronkImposter
             </span>
             <span className="text-sm font-semibold truncate">Real-time party game</span>
           </div>
